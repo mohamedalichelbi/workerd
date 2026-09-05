@@ -76,6 +76,11 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
       kj::Path path,
       GetActorFn getActor);
 
+  AlarmScheduler(const kj::Clock& clock,
+      kj::Timer& timer,
+      kj::Own<SqliteDatabase> db,
+      GetActorFn getActor);
+
   kj::Maybe<kj::Date> getAlarm(ActorKey actor);
   bool setAlarm(ActorKey actor, kj::Date scheduledTime);
   bool deleteAlarm(ActorKey actor);

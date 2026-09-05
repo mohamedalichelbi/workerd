@@ -69,6 +69,7 @@ class SqliteObserver {
 class SqliteDatabase {
  public:
   class Vfs;
+  class ExternalVfs;
   class Query;
   class Statement;
   class Lock;
@@ -112,6 +113,14 @@ class SqliteDatabase {
   };
 
   SqliteDatabase(const Vfs& vfs,
+      kj::Path path,
+      kj::Maybe<kj::WriteMode> maybeMode = kj::none,
+      size_t sqliteMaxMemoryBytes = kj::maxValue,
+      size_t sqliteMaxMemoryPerProcessBytes = kj::maxValue,
+      SqliteObserver& sqliteObserver = SqliteObserver::DEFAULT,
+      kj::Maybe<const ActorAccountLimits&> actorAccountLimits = kj::none);
+
+  SqliteDatabase(const ExternalVfs& vfs,
       kj::Path path,
       kj::Maybe<kj::WriteMode> maybeMode = kj::none,
       size_t sqliteMaxMemoryBytes = kj::maxValue,
@@ -346,7 +355,7 @@ class SqliteDatabase {
   }
 
  private:
-  const Vfs& vfs;
+  kj::OneOf<const Vfs*, const ExternalVfs*> vfs;
   kj::Path path;
   bool readOnly;
   SqliteObserver& sqliteObserver;
@@ -915,6 +924,29 @@ class SqliteDatabase::Vfs {
 
   friend class SqliteDatabase;
   class DefaultLockManager;
+};
+
+// Opens databases through a VFS that an operator-provided SQLite extension
+// registered in the process. The path mapper provides per-database URI
+// parameters without exposing them to application SQL.
+class SqliteDatabase::ExternalVfs {
+ public:
+  using PathMapper = kj::Function<kj::String(kj::PathPtr)>;
+
+  ExternalVfs(kj::String name, PathMapper pathMapper);
+
+  static void loadExtension(kj::StringPtr path, kj::StringPtr expectedVfsName);
+
+  kj::String mapPath(kj::PathPtr path) const;
+  void remove(kj::PathPtr path) const;
+
+  KJ_DISALLOW_COPY_AND_MOVE(ExternalVfs);
+
+ private:
+  kj::String name;
+  mutable PathMapper pathMapper;
+
+  friend class SqliteDatabase;
 };
 
 class SqliteDatabase::LockManager {

@@ -33,24 +33,30 @@ AlarmScheduler::AlarmScheduler(const kj::Clock& clock,
     const SqliteDatabase::Vfs& vfs,
     kj::Path path,
     GetActorFn getActor)
+    : AlarmScheduler(clock, timer,
+          [&] {
+    auto db = kj::heap<SqliteDatabase>(vfs, kj::mv(path),
+        kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+    db->run("PRAGMA journal_mode=WAL;");
+    return db;
+  }(),
+          kj::mv(getActor)) {}
+
+AlarmScheduler::AlarmScheduler(const kj::Clock& clock,
+    kj::Timer& timer,
+    kj::Own<SqliteDatabase> db,
+    GetActorFn getActor)
     : clock(clock),
       timer(timer),
       random(makeSeededRandomEngine()),
       getActor(kj::mv(getActor)),
-      db([&] {
-        auto db = kj::heap<SqliteDatabase>(vfs, kj::mv(path),
-            kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
-        ensureInitialized(*db);
-        return kj::mv(db);
-      }()),
+      db(kj::mv(db)),
       tasks(*this) {
+  ensureInitialized(*this->db);
   loadAlarmsFromDb();
 }
 
 void AlarmScheduler::ensureInitialized(SqliteDatabase& db) {
-  // TODO(sqlite): Do this automatically at a lower layer?
-  db.run("PRAGMA journal_mode=WAL;");
-
   db.run(R"(
     CREATE TABLE IF NOT EXISTS _cf_ALARM (
       actor_id TEXT PRIMARY KEY,

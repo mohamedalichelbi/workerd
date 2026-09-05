@@ -99,6 +99,16 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "actor-storage",
+    srcs = ["actor-storage.c++"],
+    hdrs = ["actor-storage.h"],
+    deps = [
+        "//src/workerd/util:sqlite",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+wd_cc_library(
     name = "actor-id-impl",
     srcs = [
         "actor-id-impl.c++",
@@ -177,6 +187,7 @@ wd_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":actor-id-impl",
+        ":actor-storage",
         ":fallback-service",
         ":pyodide",
         ":workerd-debug-port-client",

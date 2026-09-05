@@ -4,6 +4,7 @@
 
 #include "server.h"
 
+#include "actor-storage.h"
 #include "alarm-scheduler.h"
 #include "container-client.h"
 #include "pyodide.h"
@@ -384,11 +385,10 @@ class Server::ActorNamespace final {
         waitUntilTasks(waitUntilTasks),
         selfTokensArePersistent(selfTokensArePersistent) {}
 
-  void link(kj::Maybe<const kj::Directory&> serviceActorStorage) {
-    KJ_IF_SOME(dir, serviceActorStorage) {
+  void link(kj::Maybe<ActorStorageBackend&> serviceActorStorage) {
+    KJ_IF_SOME(backend, serviceActorStorage) {
       KJ_IF_SOME(d, config.tryGet<Durable>()) {
-        this->actorStorage.emplace(
-            dir.openSubdir(kj::Path({d.uniqueKey}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY));
+        this->actorStorage = backend.openNamespace(d.uniqueKey);
       }
     }
 
@@ -405,10 +405,10 @@ class Server::ActorNamespace final {
       };
 
       KJ_IF_SOME(as, this->actorStorage) {
-        // Create per-namespace alarm scheduler backed by on-disk storage in the
-        // namespace directory, alongside the per-actor .sqlite files.
-        this->ownAlarmScheduler = kj::heap<AlarmScheduler>(
-            clock, timer, as.vfs, kj::Path({"metadata.sqlite"}), kj::mv(getActor));
+        auto db = as->openDatabase(kj::Path({"metadata.sqlite"}),
+            kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+        this->ownAlarmScheduler =
+            kj::heap<AlarmScheduler>(clock, timer, kj::mv(db), kj::mv(getActor));
       } else {
         // No on-disk storage -- create an in-memory alarm scheduler.
         auto memDir = kj::newInMemoryDirectory(clock);
@@ -761,7 +761,7 @@ class Server::ActorNamespace final {
         // Note that if there's no facet index then there couldn't possibly be any child storage.
         KJ_IF_SOME(index, getFacetTreeIndexIfNotEmpty()) {
           uint childId = index.getId(getFacetId(), name);
-          deleteFacetImpl(*as.directory, index, childId);
+          deleteFacetImpl(*as, index, childId);
         }
       }
     }
@@ -786,13 +786,13 @@ class Server::ActorNamespace final {
         // Delete dst's existing storage first, mirroring the storage-side behavior of
         // deleteFacet() (the abort was already handled above).
         uint dstId = index.getId(parentId, dst);
-        deleteFacetImpl(*as.directory, index, dstId);
+        deleteFacetImpl(*as, index, dstId);
 
         // Now copy src to dst. If src's DB file does not exist, then src has no data, which
         // in the Durable Objects model is indistinguishable from src never having run. In
         // that case dst should also have no data, which it already does (we just deleted it).
         uint srcId = index.getId(parentId, src);
-        cloneFacetImpl(*as.directory, index, srcId, dstId);
+        cloneFacetImpl(*as, index, srcId, dstId);
       }
     }
 
@@ -881,7 +881,7 @@ class Server::ActorNamespace final {
         // or creating it if it doesn't exist).
         auto& as = KJ_REQUIRE_NONNULL(
             ns.actorStorage, "can't call getFacetId() when there's no backing storage");
-        auto indexFile = as.directory->openFile(
+        auto indexFile = as->openAuxiliaryFile(
             kj::Path({kj::str(key, ".facets")}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
         return *facetTreeIndex.emplace(kj::heap<FacetTreeIndex>(kj::mv(indexFile)));
       }
@@ -897,8 +897,8 @@ class Server::ActorNamespace final {
         // Facet tree index hasn't been initialized yet. If the file exists, open it. Otherwise,
         // assume empty and return none.
         auto& as = KJ_UNWRAP_OR(ns.actorStorage, return kj::none);
-        auto indexFile = KJ_UNWRAP_OR(
-            as.directory->tryOpenFile(kj::Path({kj::str(key, ".facets")}), kj::WriteMode::MODIFY),
+        auto indexFile = KJ_UNWRAP_OR(as->tryOpenAuxiliaryFile(
+            kj::Path({kj::str(key, ".facets")}), kj::WriteMode::MODIFY),
             return kj::none);
         return *facetTreeIndex.emplace(kj::heap<FacetTreeIndex>(kj::mv(indexFile)));
       }
@@ -915,33 +915,32 @@ class Server::ActorNamespace final {
       }
     }
 
-    void deleteFacetImpl(const kj::Directory& dir, FacetTreeIndex& index, uint facetId) {
-      deleteDescendantStorage(dir, index, facetId);
-
-      // Remove the database, WAL, and SHM files, if present. Note that the database may not
-      // exist at all if this facet didn't exist before delete() was called on it.
-      dir.tryRemove(getSqlitePathForId(facetId));
-      dir.tryRemove(getSqlitePathForId(facetId, "-wal"));
-      dir.tryRemove(getSqlitePathForId(facetId, "-shm"));
+    void deleteFacetImpl(ActorStorageNamespace& storage, FacetTreeIndex& index, uint facetId) {
+      deleteDescendantStorage(storage, index, facetId);
+      storage.removeDatabase(getSqlitePathForId(facetId));
     }
 
-    void deleteDescendantStorage(const kj::Directory& dir, uint parentId) {
+    void deleteDescendantStorage(ActorStorageNamespace& storage, uint parentId) {
       KJ_IF_SOME(index, getFacetTreeIndexIfNotEmpty()) {
-        deleteDescendantStorage(dir, index, parentId);
+        deleteDescendantStorage(storage, index, parentId);
       } else {
         // There's no index, so there must be no facets (other than the root).
         KJ_ASSERT(parentId == 0);
       }
     }
 
-    void deleteDescendantStorage(const kj::Directory& dir, FacetTreeIndex& index, uint parentId) {
+    void deleteDescendantStorage(
+        ActorStorageNamespace& storage, FacetTreeIndex& index, uint parentId) {
       index.forEachChild(parentId,
-          [&](uint childId, kj::StringPtr childName) { deleteFacetImpl(dir, index, childId); });
+          [&](uint childId, kj::StringPtr childName) {
+        deleteFacetImpl(storage, index, childId);
+      });
     }
 
     // Recursively copy the subtree rooted at the facet with ID `srcParentId` to a new subtree
     // rooted at the facet with ID `dstParentId`.
-    void cloneFacetImpl(const kj::Directory& dir, FacetTreeIndex& index, uint srcId, uint dstId) {
+    void cloneFacetImpl(
+        ActorStorageNamespace& storage, FacetTreeIndex& index, uint srcId, uint dstId) {
       // Snapshot src's children before recursing, because the recursion mutates the index by
       // allocating new IDs for the destination subtree, which would interfere with a live
       // forEachChild iteration.
@@ -956,36 +955,14 @@ class Server::ActorNamespace final {
 
       for (auto& child: children) {
         uint newChildId = index.getId(dstId, child.name);
-        cloneFacetImpl(dir, index, child.id, newChildId);
+        cloneFacetImpl(storage, index, child.id, newChildId);
       }
 
       // Now that the children are copied, copy the main facet.
       auto srcDb = getSqlitePathForId(srcId);
 
-      // It's possible there's no backing file on disk, if the facet existed previously but was
-      // deleted. If the source facet has no data, then leaving the destination with no data
-      // is correct.
-      if (!dir.exists(srcDb)) return;
-
-      // Copy the database. Use KJ's Directory::transfer() which will use copy-on-write where
-      // available (e.g. FICLONE on Linux, if the FS supports it).
       auto dstDb = getSqlitePathForId(dstId);
-      dir.transfer(dstDb, kj::WriteMode::CREATE, srcDb, kj::TransferMode::COPY);
-
-      // Copy the WAL if it exists. We can't rely on the source's WAL having been checkpointed
-      // and truncated at close time -- e.g., a previous process may have crashed leaving a
-      // valid WAL. Copying the WAL alongside the DB preserves any unmerged data.
-      auto srcWal = getSqlitePathForId(srcId, "-wal");
-      if (!dir.exists(srcWal)) return;
-      auto dstWal = getSqlitePathForId(dstId, "-wal");
-      dir.transfer(dstWal, kj::WriteMode::CREATE, srcWal, kj::TransferMode::COPY);
-
-      // Finally copy the SHM file if present. This is not strictly necessary but if the WAL is
-      // large this helps SQLite start up faster.
-      auto srcShm = getSqlitePathForId(srcId, "-shm");
-      if (!dir.exists(srcShm)) return;
-      auto dstShm = getSqlitePathForId(dstId, "-shm");
-      dir.transfer(dstShm, kj::WriteMode::CREATE, srcShm, kj::TransferMode::COPY);
+      storage.cloneDatabase(srcDb, dstDb);
     }
 
     void requireNotBroken() {
@@ -1263,15 +1240,11 @@ class Server::ActorNamespace final {
 
             uint selfId = getFacetId();
             auto path = getSqlitePathForId(selfId);
-            auto db = kj::heap<SqliteDatabase>(
-                as.vfs, kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+            auto db = as->openDatabase(
+                kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
 
-            // Before we do anything, make sure the database is in WAL mode. We also need to
-            // do this after reset() is used, so register a callback for that.
-            db->run("PRAGMA journal_mode=WAL;");
-
-            db->afterReset([this, &dir = *as.directory, selfId](SqliteDatabase& db) {
-              db.run("PRAGMA journal_mode=WAL;");
+            db->afterReset([this, &storage = *as, selfId](SqliteDatabase& db) {
+              storage.configureDatabase(db);
 
               // reset() is used when the app called deleteAll(), in which case we also want to
               // delete all child facets.
@@ -1281,7 +1254,7 @@ class Server::ActorNamespace final {
               //   like store a flag in the parent DB saying "reset pending" so that on a restart
               //   we retry the deletions. Note that in production on SRS, this is actually
               //   transactional -- there's only a problem when running locally with workerd.
-              deleteDescendantStorage(dir, selfId);
+              deleteDescendantStorage(storage, selfId);
             });
 
             return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
@@ -1538,18 +1511,8 @@ class Server::ActorNamespace final {
   const ActorConfig& config;
   const kj::Clock& clock;
 
-  struct ActorStorage {
-    kj::Own<const kj::Directory> directory;
-    SqliteDatabase::Vfs vfs;
-
-    ActorStorage(kj::Own<const kj::Directory> directoryParam)
-        : directory(kj::mv(directoryParam)),
-          vfs(*directory) {}
-  };
-
-  // Note: The Vfs, actorStorage, and ownAlarmScheduler must not be torn down until all actors
-  // have been torn down, so we declare them before `actors`.
-  kj::Maybe<ActorStorage> actorStorage;
+  // Storage and the alarm scheduler must outlive every actor connection.
+  kj::Maybe<kj::Own<ActorStorageNamespace>> actorStorage;
   kj::Maybe<kj::Own<AlarmScheduler>> ownAlarmScheduler;
 
   // Tracks the canceler and cleanup promise for a Docker container's lifecycle cleanup.
@@ -3426,7 +3389,7 @@ class Server::WorkerService final: public Service,
     kj::Array<kj::Own<IoChannelFactory::ActorClassChannel>> actorClass;
     kj::Array<kj::Own<IoChannelFactory::RpcChannel>> rpc;
     kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> cache;
-    kj::Maybe<const kj::Directory&> actorStorage;
+    kj::Maybe<kj::Own<ActorStorageBackend>> actorStorage;
     kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> tails;
     kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> streamingTails;
     kj::Array<kj::Rc<WorkerLoaderNamespace>> workerLoaders;
@@ -3627,7 +3590,8 @@ class Server::WorkerService final: public Service,
     auto linked = callback(*this, errorReporter);
 
     for (auto& ns: actorNamespaces) {
-      ns.value->link(linked.actorStorage);
+      ns.value->link(linked.actorStorage.map(
+          [](kj::Own<ActorStorageBackend>& backend) -> ActorStorageBackend& { return *backend; }));
     }
 
     ioChannels = kj::mv(linked);
@@ -6034,7 +5998,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       KJ_IF_SOME(svc, this->services.find(def.actorStorageConf.getLocalDisk())) {
         KJ_IF_SOME(diskSvc, kj::tryDowncast<DiskDirectoryService>(*svc)) {
           KJ_IF_SOME(dir, diskSvc.getWritable()) {
-            result.actorStorage = dir;
+            result.actorStorage = newLocalActorStorageBackend(dir);
           } else {
             errorReporter.addError(
                 kj::str("durableObjectStorage config refers to the disk service \"", diskName,
@@ -6047,6 +6011,33 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       } else {
         errorReporter.addError(kj::str("durableObjectStorage config refers to a service \"",
             diskName, "\", but no such service is defined."));
+      }
+    } else if (def.actorStorageConf.isRemoteLtx()) {
+      auto remote = def.actorStorageConf.getRemoteLtx();
+      kj::StringPtr diskName = remote.getCacheDisk();
+      KJ_IF_SOME(svc, this->services.find(diskName)) {
+        KJ_IF_SOME(diskSvc, kj::tryDowncast<DiskDirectoryService>(*svc)) {
+          KJ_IF_SOME(dir, diskSvc.getWritable()) {
+            result.actorStorage = newRemoteLtxActorStorageBackend(dir,
+                {
+                  .extensionPath = kj::str(remote.getExtensionPath()),
+                  .replicaUrl = kj::str(remote.getReplicaUrl()),
+                  .vfsName = kj::str(remote.getVfsName()),
+                  .syncInterval = kj::str(remote.getSyncInterval()),
+                  .cacheDirectory = kj::str(remote.getCacheDirectory()),
+                  .pageCacheBytes = remote.getPageCacheBytes(),
+                });
+          } else {
+            errorReporter.addError(kj::str("remoteLtx cache service \"", diskName,
+                "\" is defined read-only."));
+          }
+        } else {
+          errorReporter.addError(kj::str("remoteLtx cache service \"", diskName,
+              "\" is not a local disk service."));
+        }
+      } else {
+        errorReporter.addError(
+            kj::str("remoteLtx refers to missing cache service \"", diskName, "\"."));
       }
     }
 
@@ -7025,6 +7016,7 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
           goto validDurableObjectStorage;
         case config::Worker::DurableObjectStorage::IN_MEMORY:
         case config::Worker::DurableObjectStorage::LOCAL_DISK:
+        case config::Worker::DurableObjectStorage::REMOTE_LTX:
           goto validDurableObjectStorage;
       }
       reportConfigError(kj::str("Encountered unknown durableObjectStorage type in service \"", name,
