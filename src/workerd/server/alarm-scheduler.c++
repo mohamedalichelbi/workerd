@@ -50,9 +50,11 @@ AlarmScheduler::AlarmScheduler(const kj::Clock& clock,
       timer(timer),
       random(makeSeededRandomEngine()),
       getActor(kj::mv(getActor)),
-      db(kj::mv(db)),
+      db([&] {
+    ensureInitialized(*db);
+    return kj::mv(db);
+  }()),
       tasks(*this) {
-  ensureInitialized(*this->db);
   loadAlarmsFromDb();
 }
 
