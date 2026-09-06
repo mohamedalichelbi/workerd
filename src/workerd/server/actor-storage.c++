@@ -12,6 +12,16 @@
 namespace workerd::server {
 namespace {
 
+constexpr auto REMOTE_LTX_CONFIRM_POLL_INTERVAL = 10 * kj::MILLISECONDS;
+
+uint64_t readTxid(SqliteDatabase& db, kj::StringPtr pragma) {
+  auto query = db.run({.regulator = SqliteDatabase::TRUSTED}, pragma);
+  KJ_REQUIRE(!query.isDone(), "Litestream VFS did not return a transaction ID", pragma);
+  auto value = query.getInt64(0);
+  KJ_REQUIRE(value >= 0, "Litestream VFS returned an invalid transaction ID", pragma, value);
+  return static_cast<uint64_t>(value);
+}
+
 class LocalActorStorageNamespace final: public ActorStorageNamespace {
  public:
   explicit LocalActorStorageNamespace(kj::Own<const kj::Directory> directory)
@@ -136,6 +146,13 @@ class RemoteLtxActorStorageNamespace final: public ActorStorageNamespace {
     auto mode = db.run("PRAGMA journal_mode=DELETE;");
     KJ_REQUIRE(!mode.isDone() && mode.getText(0) == "delete"_kj,
         "remote LTX VFS requires rollback-journal mode");
+  }
+
+  kj::Promise<void> confirmDatabaseCommit(SqliteDatabase& db, kj::Timer& timer) override {
+    auto ticket = readTxid(db, "PRAGMA litestream_durability_ticket;");
+    while (readTxid(db, "PRAGMA litestream_txid;") < ticket) {
+      co_await timer.afterDelay(REMOTE_LTX_CONFIRM_POLL_INTERVAL);
+    }
   }
 
   kj::Own<const kj::File> openAuxiliaryFile(kj::Path path, kj::WriteMode mode) override {

@@ -6,6 +6,7 @@
 
 #include <workerd/util/sqlite.h>
 
+#include <kj/async-io.h>
 #include <kj/filesystem.h>
 
 namespace workerd::server {
@@ -17,6 +18,9 @@ class ActorStorageNamespace {
   virtual kj::Own<SqliteDatabase> openDatabase(
       kj::Path path, kj::Maybe<kj::WriteMode> mode = kj::none) = 0;
   virtual void configureDatabase(SqliteDatabase& db) = 0;
+  virtual kj::Promise<void> confirmDatabaseCommit(SqliteDatabase&, kj::Timer&) {
+    return kj::READY_NOW;
+  }
 
   virtual kj::Own<const kj::File> openAuxiliaryFile(
       kj::Path path, kj::WriteMode mode) = 0;

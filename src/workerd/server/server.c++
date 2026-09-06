@@ -1242,6 +1242,7 @@ class Server::ActorNamespace final {
             auto path = getSqlitePathForId(selfId);
             auto db = as->openDatabase(
                 kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+            auto* database = db.get();
 
             db->afterReset([this, &storage = *as, selfId](SqliteDatabase& db) {
               storage.configureDatabase(db);
@@ -1258,7 +1259,10 @@ class Server::ActorNamespace final {
             });
 
             return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
-                [](SpanParent) -> kj::Promise<void> { return kj::READY_NOW; }, *sqliteHooks)
+                [this, &storage = *as, database, &outputGate](SpanParent parentSpan) {
+              return outputGate.lockWhile(
+                  storage.confirmDatabaseCommit(*database, timer), kj::mv(parentSpan));
+            }, *sqliteHooks)
                 .attach(kj::mv(sqliteHooks));
           } else {
             // Create an ActorCache backed by a fake, empty storage. Elsewhere, we configure
