@@ -738,6 +738,31 @@ struct Worker {
     # a number of different extensions depending on the storage mode. (Currently, the main storage
     # is a file with the extension `.sqlite`, and in certain situations extra files with the
     # extensions `.sqlite-wal`, and `.sqlite-shm` may also be present.)
+
+    remoteLtx @20 :RemoteLtxStorage;
+    # **EXPERIMENTAL; SUBJECT TO BACKWARDS-INCOMPATIBLE CHANGE**
+    #
+    # Opens Durable Object databases through an extension-provided SQLite VFS. The VFS stores
+    # synchronized database state as LTX objects. The cache disk is disposable and must not be
+    # treated as authoritative storage. Hydration is always disabled by this configuration.
+  }
+
+  struct RemoteLtxStorage {
+    cacheDisk @0 :Text;
+    # Name of a writable DiskDirectory service for temporary files and facet indexes.
+
+    cacheDirectory @1 :Text;
+    # Native path used by the extension for disposable write buffers.
+
+    extensionPath @2 :Text;
+    # Native path to the SQLite extension that registers the configured VFS.
+
+    replicaUrl @3 :Text;
+    # Base replica URL. Workerd appends the namespace key and database name.
+
+    vfsName @4 :Text = "litestream";
+    syncInterval @5 :Text = "1s";
+    pageCacheBytes @6 :UInt64 = 10485760;
   }
 
   # TODO(someday): Support distributing objects across a cluster. At present, objects are always

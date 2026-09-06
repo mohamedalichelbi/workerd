@@ -594,7 +594,24 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs,
     size_t sqliteMaxMemoryPerProcessBytes,
     SqliteObserver& sqliteObserver,
     kj::Maybe<const ActorAccountLimits&> actorAccountLimits)
-    : vfs(vfs),
+    : vfs(&vfs),
+      path(kj::mv(path)),
+      readOnly(maybeMode == kj::none),
+      sqliteObserver(sqliteObserver),
+      sqliteMaxMemoryBytes(sqliteMaxMemoryBytes),
+      sqliteMaxMemoryPerProcessBytes(sqliteMaxMemoryPerProcessBytes),
+      actorAccountLimits(actorAccountLimits) {
+  init(maybeMode);
+}
+
+SqliteDatabase::SqliteDatabase(const ExternalVfs& vfs,
+    kj::Path path,
+    kj::Maybe<kj::WriteMode> maybeMode,
+    size_t sqliteMaxMemoryBytes,
+    size_t sqliteMaxMemoryPerProcessBytes,
+    SqliteObserver& sqliteObserver,
+    kj::Maybe<const ActorAccountLimits&> actorAccountLimits)
+    : vfs(&vfs),
       path(kj::mv(path)),
       readOnly(maybeMode == kj::none),
       sqliteObserver(sqliteObserver),
@@ -616,38 +633,39 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
   // cleaning up a partial db even when SQLITE_CALL_NODB throws.
   KJ_ON_SCOPE_FAILURE(sqlite3_close_v2(db));
 
+  int flags = SQLITE_OPEN_READONLY;
   KJ_IF_SOME(mode, maybeMode) {
-    int flags = SQLITE_OPEN_READWRITE;
+    flags = SQLITE_OPEN_READWRITE;
     if (kj::has(mode, kj::WriteMode::CREATE)) {
       flags |= SQLITE_OPEN_CREATE;
-
-      if (kj::has(mode, kj::WriteMode::CREATE_PARENT) && path.size() > 1) {
-        // SQLite isn't going to try to create the parent directory so let's try to create it now.
-        vfs.directory.openSubdir(path.parent(),
-            kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
-      }
     }
     KJ_REQUIRE(
         kj::has(mode, kj::WriteMode::MODIFY), "SQLite doesn't support create-exclusive mode");
+  }
 
-    KJ_IF_SOME(rootedPath, vfs.tryAppend(path)) {
+  KJ_IF_SOME(localPtr, vfs.tryGet<const Vfs*>()) {
+    const auto& local = *localPtr;
+    KJ_IF_SOME(mode, maybeMode) {
+      if (kj::has(mode, kj::WriteMode::CREATE_PARENT) && path.size() > 1) {
+        local.directory.openSubdir(path.parent(),
+            kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+      }
+    }
+
+    KJ_IF_SOME(rootedPath, local.tryAppend(path)) {
       // If we can get the path rooted in the VFS's directory, use the system's default VFS instead
       // TODO(bug): This doesn't honor vfs.options. (This branch is only used on Windows.)
       SQLITE_CALL_NODB(
           sqlite3_open_v2(rootedPath.toNativeString(true).cStr(), &db, flags, nullptr));
     } else {
-      SQLITE_CALL_NODB(sqlite3_open_v2(path.toString().cStr(), &db, flags, vfs.getName().cStr()));
+      SQLITE_CALL_NODB(
+          sqlite3_open_v2(path.toString().cStr(), &db, flags, local.getName().cStr()));
     }
   } else {
-    KJ_IF_SOME(rootedPath, vfs.tryAppend(path)) {
-      // If we can get the path rooted in the VFS's directory, use the system's default VFS instead
-      // TODO(bug): This doesn't honor vfs.options. (This branch is only used on Windows.)
-      SQLITE_CALL_NODB(sqlite3_open_v2(
-          rootedPath.toNativeString(true).cStr(), &db, SQLITE_OPEN_READONLY, nullptr));
-    } else {
-      SQLITE_CALL_NODB(
-          sqlite3_open_v2(path.toString().cStr(), &db, SQLITE_OPEN_READONLY, vfs.getName().cStr()));
-    }
+    const auto& external = *KJ_ASSERT_NONNULL(vfs.tryGet<const ExternalVfs*>());
+    auto mappedPath = external.mapPath(path);
+    SQLITE_CALL_NODB(sqlite3_open_v2(
+        mappedPath.cStr(), &db, flags | SQLITE_OPEN_URI, external.name.cStr()));
   }
 
   setupSecurity(db);
@@ -675,6 +693,46 @@ SqliteDatabase::~SqliteDatabase() noexcept(false) {
 
 SqliteDatabase::operator sqlite3*() {
   return &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
+}
+
+SqliteDatabase::ExternalVfs::ExternalVfs(kj::String name, PathMapper pathMapper)
+    : name(kj::mv(name)), pathMapper(kj::mv(pathMapper)) {
+  KJ_REQUIRE(sqlite3_vfs_find(this->name.cStr()) != nullptr,
+      "SQLite extension did not register the configured VFS", this->name);
+}
+
+void SqliteDatabase::ExternalVfs::loadExtension(
+    kj::StringPtr path, kj::StringPtr expectedVfsName) {
+  if (sqlite3_vfs_find(expectedVfsName.cStr()) != nullptr) return;
+
+  sqlite3* loader = nullptr;
+  KJ_REQUIRE(sqlite3_open(":memory:", &loader) == SQLITE_OK,
+      "failed to open the SQLite extension loader connection");
+  KJ_DEFER(sqlite3_close_v2(loader));
+
+  KJ_REQUIRE(sqlite3_enable_load_extension(loader, 1) == SQLITE_OK,
+      "this workerd build does not allow SQLite extension loading");
+  KJ_DEFER(sqlite3_enable_load_extension(loader, 0));
+
+  char* error = nullptr;
+  int result = sqlite3_load_extension(loader, path.cStr(), nullptr, &error);
+  auto message = kj::str(error == nullptr ? sqlite3_errmsg(loader) : error);
+  if (error != nullptr) sqlite3_free(error);
+  KJ_REQUIRE(result == SQLITE_OK, "failed to load SQLite VFS extension", path, message);
+  KJ_REQUIRE(sqlite3_vfs_find(expectedVfsName.cStr()) != nullptr,
+      "SQLite extension did not register the expected VFS", path, expectedVfsName);
+}
+
+kj::String SqliteDatabase::ExternalVfs::mapPath(kj::PathPtr path) const {
+  return pathMapper(path);
+}
+
+void SqliteDatabase::ExternalVfs::remove(kj::PathPtr path) const {
+  auto mappedPath = mapPath(path);
+  auto* registeredVfs = sqlite3_vfs_find(name.cStr());
+  KJ_REQUIRE(registeredVfs != nullptr, "configured SQLite VFS is no longer registered", name);
+  KJ_REQUIRE(registeredVfs->xDelete(registeredVfs, mappedPath.cStr(), 1) == SQLITE_OK,
+      "configured SQLite VFS could not delete database", mappedPath);
 }
 
 SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
@@ -1032,7 +1090,11 @@ void SqliteDatabase::reset() {
         sqlite3_errstr(err));
 
     maybeDb = kj::none;
-    vfs.directory.remove(path);
+    KJ_IF_SOME(localPtr, vfs.tryGet<const Vfs*>()) {
+      localPtr->directory.remove(path);
+    } else {
+      KJ_ASSERT_NONNULL(vfs.tryGet<const ExternalVfs*>())->remove(path);
+    }
   }
 
   KJ_ON_SCOPE_FAILURE(maybeDb = kj::none);
