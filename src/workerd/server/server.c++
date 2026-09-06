@@ -1259,9 +1259,8 @@ class Server::ActorNamespace final {
             });
 
             return kj::heap<ActorSqlite>(kj::mv(db), outputGate,
-                [this, &storage = *as, database, &outputGate](SpanParent parentSpan) {
-              return outputGate.lockWhile(
-                  storage.confirmDatabaseCommit(*database, timer), kj::mv(parentSpan));
+                [this, &storage = *as, database](SpanParent) {
+              return storage.confirmDatabaseCommit(*database, timer);
             }, *sqliteHooks)
                 .attach(kj::mv(sqliteHooks));
           } else {
