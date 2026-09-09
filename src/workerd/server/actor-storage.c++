@@ -13,14 +13,22 @@ namespace workerd::server {
 namespace {
 
 constexpr auto REMOTE_LTX_CONFIRM_POLL_INTERVAL = 10 * kj::MILLISECONDS;
+constexpr auto REMOTE_LTX_CONFIRM_TIMEOUT = 5 * kj::SECONDS;
 
-uint64_t readTxid(SqliteDatabase& db, kj::StringPtr pragma) {
-  auto query = db.run({.regulator = SqliteDatabase::TRUSTED}, pragma);
-  KJ_REQUIRE(!query.isDone(), "Litestream VFS did not return a transaction ID", pragma);
+struct DurabilityStatus {
+  uint64_t durable;
+  uint64_t ticket;
+};
+
+kj::Maybe<DurabilityStatus> readDurabilityStatus(SqliteDatabase& db) {
+  auto query =
+      db.run({.regulator = SqliteDatabase::TRUSTED}, "PRAGMA litestream_durability_status;");
+  KJ_REQUIRE(!query.isDone(), "Litestream VFS does not support durability status");
   auto value = query.getText(0);
-  KJ_REQUIRE(
-      value.size() == 16, "Litestream VFS returned an invalid transaction ID", pragma, value);
-  return kj::str("0x", value).parseAs<uint64_t>();
+  if (value == "busy"_kj) return kj::none;
+  KJ_REQUIRE(value.size() == 33 && value[16] == ':', "Invalid Litestream durability status", value);
+  return DurabilityStatus{kj::str("0x", value.slice(0, 16)).parseAs<uint64_t>(),
+    kj::str("0x", value.slice(17)).parseAs<uint64_t>()};
 }
 
 class LocalActorStorageNamespace final: public ActorStorageNamespace {
@@ -144,8 +152,14 @@ class RemoteLtxActorStorageNamespace final: public ActorStorageNamespace {
   }
 
   kj::Promise<void> confirmDatabaseCommit(SqliteDatabase& db, kj::Timer& timer) override {
-    auto ticket = readTxid(db, "PRAGMA litestream_durability_ticket;");
-    while (readTxid(db, "PRAGMA litestream_txid;") < ticket) {
+    auto deadline = timer.now() + REMOTE_LTX_CONFIRM_TIMEOUT;
+    kj::Maybe<uint64_t> ticket;
+    for (;;) {
+      KJ_IF_SOME(status, readDurabilityStatus(db)) {
+        if (ticket == kj::none) ticket = status.ticket;
+        if (status.durable >= KJ_ASSERT_NONNULL(ticket)) co_return;
+      }
+      KJ_REQUIRE(timer.now() < deadline, "Bucket persistence confirmation timed out");
       co_await timer.afterDelay(REMOTE_LTX_CONFIRM_POLL_INTERVAL);
     }
   }
