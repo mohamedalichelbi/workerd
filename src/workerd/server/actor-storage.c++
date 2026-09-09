@@ -17,18 +17,19 @@ constexpr auto REMOTE_LTX_CONFIRM_POLL_INTERVAL = 10 * kj::MILLISECONDS;
 uint64_t readTxid(SqliteDatabase& db, kj::StringPtr pragma) {
   auto query = db.run({.regulator = SqliteDatabase::TRUSTED}, pragma);
   KJ_REQUIRE(!query.isDone(), "Litestream VFS did not return a transaction ID", pragma);
-  auto value = query.getInt64(0);
-  KJ_REQUIRE(value >= 0, "Litestream VFS returned an invalid transaction ID", pragma, value);
-  return static_cast<uint64_t>(value);
+  auto value = query.getText(0);
+  KJ_REQUIRE(
+      value.size() == 16, "Litestream VFS returned an invalid transaction ID", pragma, value);
+  return kj::str("0x", value).parseAs<uint64_t>();
 }
 
 class LocalActorStorageNamespace final: public ActorStorageNamespace {
  public:
   explicit LocalActorStorageNamespace(kj::Own<const kj::Directory> directory)
-      : directory(kj::mv(directory)), vfs(*this->directory) {}
+      : directory(kj::mv(directory)),
+        vfs(*this->directory) {}
 
-  kj::Own<SqliteDatabase> openDatabase(
-      kj::Path path, kj::Maybe<kj::WriteMode> mode) override {
+  kj::Own<SqliteDatabase> openDatabase(kj::Path path, kj::Maybe<kj::WriteMode> mode) override {
     auto db = kj::heap<SqliteDatabase>(vfs, kj::mv(path), mode);
     configureDatabase(*db);
     return db;
@@ -73,8 +74,7 @@ class LocalActorStorageNamespace final: public ActorStorageNamespace {
 
   void cloneIfPresent(kj::Path source, kj::Path destination) {
     if (directory->exists(source)) {
-      directory->transfer(
-          destination, kj::WriteMode::CREATE, source, kj::TransferMode::COPY);
+      directory->transfer(destination, kj::WriteMode::CREATE, source, kj::TransferMode::COPY);
     }
   }
 };
@@ -112,8 +112,8 @@ kj::String encodeUriComponent(kj::StringPtr value) {
 
 kj::String appendUrlPath(kj::StringPtr base, kj::StringPtr namespaceKey, kj::StringPtr database) {
   auto separator = base.endsWith("/"_kj) ? ""_kj : "/"_kj;
-  return kj::str(base, separator, encodeUriComponent(namespaceKey), '/',
-      encodeUriComponent(database));
+  return kj::str(
+      base, separator, encodeUriComponent(namespaceKey), '/', encodeUriComponent(database));
 }
 
 bool enablesHydration(kj::StringPtr value) {
@@ -135,8 +135,7 @@ class RemoteLtxActorStorageNamespace final: public ActorStorageNamespace {
         vfs(kj::str(this->options.vfsName),
             [this](kj::PathPtr path) { return makeDatabaseUri(path); }) {}
 
-  kj::Own<SqliteDatabase> openDatabase(
-      kj::Path path, kj::Maybe<kj::WriteMode> mode) override {
+  kj::Own<SqliteDatabase> openDatabase(kj::Path path, kj::Maybe<kj::WriteMode> mode) override {
     auto db = kj::heap<SqliteDatabase>(vfs, kj::mv(path), mode);
     configureDatabase(*db);
     return db;
@@ -182,13 +181,14 @@ class RemoteLtxActorStorageNamespace final: public ActorStorageNamespace {
   kj::String makeDatabaseUri(kj::PathPtr path) {
     KJ_REQUIRE(path.size() == 1, "remote LTX database paths must have one component", path);
     kj::StringPtr database = path[0];
-    auto logicalName = kj::str(encodeUriComponent(namespaceKey), "--", encodeUriComponent(database));
+    auto logicalName =
+        kj::str(encodeUriComponent(namespaceKey), "--", encodeUriComponent(database));
     auto replica = appendUrlPath(options.replicaUrl, namespaceKey, database);
     auto separator = options.cacheDirectory.endsWith("/"_kj) ? ""_kj : "/"_kj;
     auto buffer = kj::str(options.cacheDirectory, separator, encodeUriComponent(namespaceKey), '/',
         encodeUriComponent(database), ".buffer");
-    return kj::str("file:", logicalName, "?vfs=",
-        encodeUriComponent(options.vfsName), "&replica_url=", encodeUriComponent(replica),
+    return kj::str("file:", logicalName, "?vfs=", encodeUriComponent(options.vfsName),
+        "&replica_url=", encodeUriComponent(replica),
         "&write_enabled=true&hydration_enabled=false&sync_interval=",
         encodeUriComponent(options.syncInterval), "&buffer_path=", encodeUriComponent(buffer),
         "&cache_size=", options.pageCacheBytes);
@@ -198,13 +198,13 @@ class RemoteLtxActorStorageNamespace final: public ActorStorageNamespace {
 class RemoteLtxActorStorageBackend final: public ActorStorageBackend {
  public:
   RemoteLtxActorStorageBackend(const kj::Directory& cacheRoot, RemoteLtxActorStorageOptions options)
-      : cacheRoot(cacheRoot), options(kj::mv(options)) {
+      : cacheRoot(cacheRoot),
+        options(kj::mv(options)) {
     if (auto* hydration = getenv("LITESTREAM_HYDRATION_ENABLED")) {
       KJ_REQUIRE(!enablesHydration(hydration),
           "remote LTX storage cannot start when Litestream hydration is enabled");
     }
-    SqliteDatabase::ExternalVfs::loadExtension(
-        this->options.extensionPath, this->options.vfsName);
+    SqliteDatabase::ExternalVfs::loadExtension(this->options.extensionPath, this->options.vfsName);
   }
 
   kj::Own<ActorStorageNamespace> openNamespace(kj::StringPtr uniqueKey) override {
