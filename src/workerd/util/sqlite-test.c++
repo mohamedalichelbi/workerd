@@ -848,6 +848,35 @@ KJ_TEST("reset database") {
   }
 }
 
+KJ_TEST("reset external VFS database without deleting its file") {
+  auto dir = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs backing(*dir);
+  SqliteDatabase::ExternalVfs external(
+      kj::str(backing.getName()), [](kj::PathPtr path) { return path.toString(); });
+  {
+    SqliteDatabase db(
+        external, kj::Path({"external"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+    db.run("CREATE TABLE things (value INTEGER); INSERT INTO things VALUES (123);");
+    auto stmt = db.prepare("SELECT value FROM things;");
+    auto query = stmt.run();
+    KJ_EXPECT(query.getInt(0) == 123);
+    auto file = dir->openFile(kj::Path({"external"}));
+
+    db.reset();
+    KJ_EXPECT_THROW_MESSAGE("query canceled because reset()", query.nextRow());
+    KJ_EXPECT_THROW_MESSAGE("no such table: things", stmt.run());
+    KJ_EXPECT(db.run("SELECT count(*) FROM sqlite_schema;").getInt(0) == 0);
+    KJ_EXPECT(file->stat().size == dir->openFile(kj::Path({"external"}))->stat().size);
+
+    db.run("CREATE TABLE things (value INTEGER); INSERT INTO things VALUES (456);");
+    KJ_EXPECT(stmt.run().getInt(0) == 456);
+    db.reset();
+  }
+  SqliteDatabase reopened(external, kj::Path({"external"}), kj::WriteMode::MODIFY);
+  KJ_EXPECT(reopened.run("SELECT count(*) FROM sqlite_schema;").getInt(0) == 0);
+  KJ_EXPECT(reopened.run("PRAGMA integrity_check;").getText(0) == "ok");
+}
+
 KJ_TEST("SQLite observer addQueryStats") {
   class TestSqliteObserver: public SqliteObserver {
    public:

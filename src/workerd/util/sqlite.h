@@ -476,6 +476,7 @@ class SqliteDatabase {
       StaticRegulator regulator);
 
   void setupSecurity(sqlite3* db);
+  bool resetInProgress = false;
 
   struct ParseContext {
     // What kind of state change does this statement cause, if any?

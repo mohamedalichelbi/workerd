@@ -658,14 +658,13 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
       SQLITE_CALL_NODB(
           sqlite3_open_v2(rootedPath.toNativeString(true).cStr(), &db, flags, nullptr));
     } else {
-      SQLITE_CALL_NODB(
-          sqlite3_open_v2(path.toString().cStr(), &db, flags, local.getName().cStr()));
+      SQLITE_CALL_NODB(sqlite3_open_v2(path.toString().cStr(), &db, flags, local.getName().cStr()));
     }
   } else {
     const auto& external = *KJ_ASSERT_NONNULL(vfs.tryGet<const ExternalVfs*>());
     auto mappedPath = external.mapPath(path);
-    SQLITE_CALL_NODB(sqlite3_open_v2(
-        mappedPath.cStr(), &db, flags | SQLITE_OPEN_URI, external.name.cStr()));
+    SQLITE_CALL_NODB(
+        sqlite3_open_v2(mappedPath.cStr(), &db, flags | SQLITE_OPEN_URI, external.name.cStr()));
   }
 
   setupSecurity(db);
@@ -696,13 +695,13 @@ SqliteDatabase::operator sqlite3*() {
 }
 
 SqliteDatabase::ExternalVfs::ExternalVfs(kj::String name, PathMapper pathMapper)
-    : name(kj::mv(name)), pathMapper(kj::mv(pathMapper)) {
+    : name(kj::mv(name)),
+      pathMapper(kj::mv(pathMapper)) {
   KJ_REQUIRE(sqlite3_vfs_find(this->name.cStr()) != nullptr,
       "SQLite extension did not register the configured VFS", this->name);
 }
 
-void SqliteDatabase::ExternalVfs::loadExtension(
-    kj::StringPtr path, kj::StringPtr expectedVfsName) {
+void SqliteDatabase::ExternalVfs::loadExtension(kj::StringPtr path, kj::StringPtr expectedVfsName) {
   if (sqlite3_vfs_find(expectedVfsName.cStr()) != nullptr) return;
 
   sqlite3* loader = nullptr;
@@ -1085,6 +1084,25 @@ void SqliteDatabase::reset() {
       listener.beforeSqliteReset();
     }
 
+    if (vfs.is<const ExternalVfs*>()) {
+      // Publish an empty database through the VFS. Keep its transaction history.
+      {
+        // VACUUM uses one internal temporary database.
+        auto attachedLimit = sqlite3_limit(&db, SQLITE_LIMIT_ATTACHED, 1);
+        KJ_DEFER(sqlite3_limit(&db, SQLITE_LIMIT_ATTACHED, attachedLimit));
+        SQLITE_CALL_NODB(sqlite3_db_config(&db, SQLITE_DBCONFIG_RESET_DATABASE, 1, nullptr));
+        KJ_DEFER(
+            SQLITE_CALL_NODB(sqlite3_db_config(&db, SQLITE_DBCONFIG_RESET_DATABASE, 0, nullptr)));
+        resetInProgress = true;
+        KJ_DEFER(resetInProgress = false);
+        run({.regulator = TRUSTED}, "VACUUM;");
+      }
+      KJ_IF_SOME(resetCb, afterResetCallback) {
+        resetCb(*this);
+      }
+      return;
+    }
+
     auto err = sqlite3_close(&db);
     KJ_REQUIRE(err == SQLITE_OK, "can't reset() database because dependent objects still exist",
         sqlite3_errstr(err));
@@ -1110,6 +1128,8 @@ bool SqliteDatabase::isAuthorized(int actionCode,
     kj::Maybe<kj::StringPtr> param2,
     kj::Maybe<kj::StringPtr> dbName,
     kj::Maybe<kj::StringPtr> triggerName) {
+  // Only reset() can run SQLite's internal empty-database VACUUM statements.
+  if (resetInProgress) return true;
   StaticRegulator regulator = KJ_UNWRAP_OR(currentRegulator, {
     // We're not currently preparing a statement, so we didn't expect the authorizer callback to
     // run. We blanket-deny in this case as a precaution.
