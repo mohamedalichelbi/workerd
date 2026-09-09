@@ -16,7 +16,7 @@ struct ExpectedChildInfo {
   kj::StringPtr name;
 };
 void expectChildren(
-    FacetTreeIndex& index, uint parentId, kj::ArrayPtr<const ExpectedChildInfo> expected) {
+    FacetIndex& index, uint parentId, kj::ArrayPtr<const ExpectedChildInfo> expected) {
   index.forEachChild(parentId, [&](uint id, kj::StringPtr name) {
     if (expected.size() == 0) {
       KJ_FAIL_EXPECT("unexpected child", id, name);
@@ -27,6 +27,45 @@ void expectChildren(
     }
   });
   KJ_EXPECT(expected.size() == 0, "missing child", expected.front().id, expected.front().name);
+}
+
+KJ_TEST("SQLite facet index preserves names and confirms storage") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  auto directory = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*directory);
+  auto upload = kj::newPromiseAndFulfiller<void>();
+  {
+    auto index = newSqliteFacetIndex(kj::heap<SqliteDatabase>(vfs, kj::Path({"facets"}),
+                                         kj::WriteMode::CREATE | kj::WriteMode::MODIFY),
+        [&](SqliteDatabase& db) -> kj::Promise<void> {
+      auto query = db.run("SELECT COUNT(*) FROM facets");
+      KJ_EXPECT(query.getInt64(0) == 3);
+      return kj::mv(upload.promise);
+    });
+    KJ_EXPECT(index->getId(0, "alpha") == 1);
+    KJ_EXPECT(index->getId(0, "beta") == 2);
+    KJ_EXPECT(index->getId(1, "beta") == 3);
+    KJ_EXPECT(index->getId(0, "alpha") == 1);
+    expectChildren(*index, 0, kj::arr(ExpectedChildInfo{1, "alpha"}, ExpectedChildInfo{2, "beta"}));
+    KJ_EXPECT_THROW_MESSAGE("Invalid facet name length", index->getId(0, ""));
+    KJ_EXPECT_THROW_MESSAGE("Invalid parent ID", index->getId(99, "child"));
+    auto confirmed = index->confirm();
+    KJ_EXPECT(!confirmed.poll(waitScope));
+    upload.fulfiller->fulfill();
+    confirmed.wait(waitScope);
+  }
+  auto index = newSqliteFacetIndex(
+      kj::heap<SqliteDatabase>(vfs, kj::Path({"facets"}), kj::WriteMode::MODIFY),
+      [](SqliteDatabase&) -> kj::Promise<void> {
+    return KJ_EXCEPTION(FAILED, "Index upload failed");
+  });
+  KJ_EXPECT(index->getId(0, "beta") == 2);
+  KJ_EXPECT(index->getId(0, "alpha") == 1);
+  KJ_EXPECT(index->getId(1, "beta") == 3);
+  KJ_EXPECT(index->getId(2, "alpha") == 4);
+  expectChildren(*index, 1, kj::arr(ExpectedChildInfo{3, "beta"}));
+  KJ_EXPECT_THROW_MESSAGE("Index upload failed", index->confirm().wait(waitScope));
 }
 
 KJ_TEST("FacetTreeIndex basic functionality") {

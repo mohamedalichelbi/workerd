@@ -39,13 +39,9 @@ class LocalActorStorageNamespace final: public ActorStorageNamespace {
     db.run("PRAGMA journal_mode=WAL;");
   }
 
-  kj::Own<const kj::File> openAuxiliaryFile(kj::Path path, kj::WriteMode mode) override {
-    return directory->openFile(kj::mv(path), mode);
-  }
-
-  kj::Maybe<kj::Own<const kj::File>> tryOpenAuxiliaryFile(
-      kj::Path path, kj::WriteMode mode) override {
-    return directory->tryOpenFile(kj::mv(path), mode);
+  kj::Own<FacetIndex> openFacetIndex(kj::Path path, kj::Timer&) override {
+    return kj::heap<FacetTreeIndex>(
+        directory->openFile(kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY));
   }
 
   void removeDatabase(kj::PathPtr path) override {
@@ -154,13 +150,12 @@ class RemoteLtxActorStorageNamespace final: public ActorStorageNamespace {
     }
   }
 
-  kj::Own<const kj::File> openAuxiliaryFile(kj::Path path, kj::WriteMode mode) override {
-    return auxiliaryDirectory->openFile(kj::mv(path), mode);
-  }
-
-  kj::Maybe<kj::Own<const kj::File>> tryOpenAuxiliaryFile(
-      kj::Path path, kj::WriteMode mode) override {
-    return auxiliaryDirectory->tryOpenFile(kj::mv(path), mode);
+  kj::Own<FacetIndex> openFacetIndex(kj::Path path, kj::Timer& timer) override {
+    KJ_REQUIRE(!auxiliaryDirectory->exists(path),
+        "Local facet index requires migration before remote storage can open it", path);
+    return newSqliteFacetIndex(
+        openDatabase(kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY),
+        [this, &timer](SqliteDatabase& db) { return confirmDatabaseCommit(db, timer); });
   }
 
   void removeDatabase(kj::PathPtr path) override {

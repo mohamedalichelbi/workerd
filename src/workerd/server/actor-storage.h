@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "facet-tree-index.h"
+
 #include <workerd/util/sqlite.h>
 
 #include <kj/async-io.h>
@@ -22,10 +24,7 @@ class ActorStorageNamespace {
     return kj::READY_NOW;
   }
 
-  virtual kj::Own<const kj::File> openAuxiliaryFile(
-      kj::Path path, kj::WriteMode mode) = 0;
-  virtual kj::Maybe<kj::Own<const kj::File>> tryOpenAuxiliaryFile(
-      kj::Path path, kj::WriteMode mode) = 0;
+  virtual kj::Own<FacetIndex> openFacetIndex(kj::Path path, kj::Timer& timer) = 0;
 
   // A database can include journal files that are private to the backend.
   virtual void removeDatabase(kj::PathPtr path) = 0;

@@ -1,11 +1,29 @@
 #pragma once
 
+#include <workerd/util/sqlite.h>
+
+#include <kj/async.h>
 #include <kj/filesystem.h>
 #include <kj/map.h>
 
 namespace workerd::server {
 
 using kj::uint;
+
+class FacetIndex {
+ public:
+  virtual uint getId(uint parent, kj::StringPtr name) = 0;
+  virtual void forEachChild(
+      uint parentId, kj::FunctionParam<void(uint, kj::StringPtr)> callback) = 0;
+  virtual kj::Promise<void> confirm() {
+    return kj::READY_NOW;
+  }
+  virtual ~FacetIndex() noexcept(false) = default;
+};
+
+// Store facet identities in SQLite and confirm them through its storage backend.
+kj::Own<FacetIndex> newSqliteFacetIndex(
+    kj::Own<SqliteDatabase> db, kj::Function<kj::Promise<void>(SqliteDatabase&)> confirmCommit);
 
 // Implements an index, stored on disk, which maps leaves of a tree to small integers in a stable
 // way.
@@ -47,18 +65,17 @@ using kj::uint;
 // The index file is prefixed with the 8-byte magic number 0xc4cdce5bc5b0ef57. All integers
 // (including the magic number) are in host byte order (which is little-endian on all supported
 // platforms).
-class FacetTreeIndex {
+class FacetTreeIndex final: public FacetIndex {
  public:
   // Construct the index, reading the given file to populate the initial index, and then arranging
   // to append new entries to the file as needed.
   FacetTreeIndex(kj::Own<const kj::File> file);
 
   // Gets the ID for the given facet, assigning it if needed.
-  uint getId(uint parent, kj::StringPtr name);
+  uint getId(uint parent, kj::StringPtr name) override;
 
   // For each child of the given parent ID, call the callback.
-  template <typename Func>
-  void forEachChild(uint parentId, Func&& callback) {
+  void forEachChild(uint parentId, kj::FunctionParam<void(uint, kj::StringPtr)> callback) override {
     for (auto& child: entries.range(EntryPtr{parentId, nullptr}, EntryPtr{parentId + 1, nullptr})) {
       KJ_IASSERT(child.parent == parentId);
       uint childId = 1 + (&child - entries.begin());

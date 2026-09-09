@@ -8,6 +8,66 @@ namespace workerd::server {
 using kj::byte;
 using kj::uint;
 
+namespace {
+
+class SqliteFacetIndex final: public FacetIndex {
+ public:
+  SqliteFacetIndex(
+      kj::Own<SqliteDatabase> db, kj::Function<kj::Promise<void>(SqliteDatabase&)> confirmCommit)
+      : db(kj::mv(db)),
+        confirmCommit(kj::mv(confirmCommit)) {
+    this->db->run(R"(
+      CREATE TABLE IF NOT EXISTS facets (
+        id INTEGER PRIMARY KEY CHECK(id BETWEEN 1 AND 65535),
+        parent INTEGER NOT NULL CHECK(parent >= 0 AND parent < id),
+        name TEXT NOT NULL CHECK(length(CAST(name AS BLOB)) BETWEEN 1 AND 65535),
+        UNIQUE(parent, name)
+      );
+    )");
+  }
+
+  uint getId(uint parent, kj::StringPtr name) override {
+    KJ_REQUIRE(name.size() > 0 && name.size() <= MAX_ID, "Invalid facet name length");
+    {
+      auto query = db->run("SELECT id FROM facets WHERE parent = ? AND name = ?", parent, name);
+      if (!query.isDone()) return query.getInt64(0);
+    }
+    uint nextId;
+    {
+      auto query = db->run("SELECT COALESCE(MAX(id), 0) + 1 FROM facets");
+      nextId = query.getInt64(0);
+    }
+    KJ_REQUIRE(nextId <= MAX_ID, "Maximum number of facets exceeded");
+    KJ_REQUIRE(parent < nextId, "Invalid parent ID");
+    db->run("INSERT INTO facets VALUES (?, ?, ?)", nextId, parent, name);
+    return nextId;
+  }
+
+  void forEachChild(uint parent, kj::FunctionParam<void(uint, kj::StringPtr)> callback) override {
+    auto query = db->run("SELECT id, name FROM facets WHERE parent = ? ORDER BY name", parent);
+    while (!query.isDone()) {
+      callback(query.getInt64(0), query.getText(1));
+      query.nextRow();
+    }
+  }
+
+  kj::Promise<void> confirm() override {
+    return confirmCommit(*db);
+  }
+
+ private:
+  static constexpr uint MAX_ID = 65535;
+  kj::Own<SqliteDatabase> db;
+  kj::Function<kj::Promise<void>(SqliteDatabase&)> confirmCommit;
+};
+
+}  // namespace
+
+kj::Own<FacetIndex> newSqliteFacetIndex(
+    kj::Own<SqliteDatabase> db, kj::Function<kj::Promise<void>(SqliteDatabase&)> confirmCommit) {
+  return kj::heap<SqliteFacetIndex>(kj::mv(db), kj::mv(confirmCommit));
+}
+
 FacetTreeIndex::FacetTreeIndex(kj::Own<const kj::File> fileParam): file(kj::mv(fileParam)) {
   // Read the file to populate the initial index
 

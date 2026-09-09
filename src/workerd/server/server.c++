@@ -601,6 +601,8 @@ class Server::ActorNamespace final {
     // Get the actor, starting it if it's not already running.
     kj::Promise<kj::Own<Worker::Actor>> getActor() {
       requireNotBroken();
+      // Index confirmation must not outlive the root-owned database.
+      auto rootRef = root.addRef();
 
       if (actor == kj::none) {
         KJ_IF_SOME(promise, classAndId.tryGet<kj::ForkedPromise<void>>()) {
@@ -612,6 +614,14 @@ class Server::ActorNamespace final {
 
         KJ_IF_SOME(promise, actorClass->whenReady()) {
           co_await promise;
+          requireNotBroken();
+        }
+
+        if (parent != kj::none && ns.actorStorage != kj::none) {
+          getFacetId();
+          // Publish the ID before its database can acquire any state.
+          co_await root.ensureFacetTreeIndex().confirm();
+          root.requireNotBroken();
           requireNotBroken();
         }
 
@@ -761,7 +771,7 @@ class Server::ActorNamespace final {
       // Then delete the underlying storage.
       KJ_IF_SOME(as, ns.actorStorage) {
         // Note that if there's no facet index then there couldn't possibly be any child storage.
-        KJ_IF_SOME(index, getFacetTreeIndexIfNotEmpty()) {
+        KJ_IF_SOME(index, tryGetFacetTreeIndex()) {
           uint childId = index.getId(getFacetId(), name);
           deleteFacetImpl(*as, index, childId);
         }
@@ -782,7 +792,7 @@ class Server::ActorNamespace final {
       auto& as = KJ_UNWRAP_OR(ns.actorStorage, return);
 
       // If no index exists on disk, there can be no storage to delete or copy.
-      KJ_IF_SOME(index, getFacetTreeIndexIfNotEmpty()) {
+      KJ_IF_SOME(index, tryGetFacetTreeIndex()) {
         uint parentId = getFacetId();
 
         // Delete dst's existing storage first, mirroring the storage-side behavior of
@@ -851,7 +861,7 @@ class Server::ActorNamespace final {
     kj::OneOf<ClassAndId, kj::ForkedPromise<void>> classAndId;
 
     // FacetTreeIndex for this actor. Only initialized on the root.
-    kj::Maybe<kj::Own<FacetTreeIndex>> facetTreeIndex;
+    kj::Maybe<kj::Own<FacetIndex>> facetTreeIndex;
 
     // ID of this facet. Initialized when getFacetId() is first called.
     kj::Maybe<uint> facetId;
@@ -867,13 +877,15 @@ class Server::ActorNamespace final {
 
       ActorContainer& parent = KJ_UNWRAP_OR(this->parent, return 0);
 
-      FacetTreeIndex& index = root.ensureFacetTreeIndex();
-      return index.getId(parent.getFacetId(), key);
+      FacetIndex& index = root.ensureFacetTreeIndex();
+      auto id = index.getId(parent.getFacetId(), key);
+      facetId = id;
+      return id;
     }
 
     // Get the facet tree index, opening the file if it hasn't been opened yet, and creating it
     // if it hasn't been created yet.
-    FacetTreeIndex& ensureFacetTreeIndex() {
+    FacetIndex& ensureFacetTreeIndex() {
       KJ_REQUIRE(parent == kj::none, "only 'root' may ensureFacetTreeIndex()");
 
       KJ_IF_SOME(i, facetTreeIndex) {
@@ -883,27 +895,15 @@ class Server::ActorNamespace final {
         // or creating it if it doesn't exist).
         auto& as = KJ_REQUIRE_NONNULL(
             ns.actorStorage, "can't call getFacetId() when there's no backing storage");
-        auto indexFile = as->openAuxiliaryFile(
-            kj::Path({kj::str(key, ".facets")}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
-        return *facetTreeIndex.emplace(kj::heap<FacetTreeIndex>(kj::mv(indexFile)));
+        return *facetTreeIndex.emplace(
+            as->openFacetIndex(kj::Path({kj::str(key, ".facets")}), timer));
       }
     }
 
-    // Like ensureFacetTreeIndex() but if the index doesn't exist on disk, return kj::none.
-    kj::Maybe<FacetTreeIndex&> getFacetTreeIndexIfNotEmpty() {
-      KJ_REQUIRE(parent == kj::none);
-
-      KJ_IF_SOME(i, facetTreeIndex) {
-        return *i;
-      } else {
-        // Facet tree index hasn't been initialized yet. If the file exists, open it. Otherwise,
-        // assume empty and return none.
-        auto& as = KJ_UNWRAP_OR(ns.actorStorage, return kj::none);
-        auto indexFile = KJ_UNWRAP_OR(
-            as->tryOpenAuxiliaryFile(kj::Path({kj::str(key, ".facets")}), kj::WriteMode::MODIFY),
-            return kj::none);
-        return *facetTreeIndex.emplace(kj::heap<FacetTreeIndex>(kj::mv(indexFile)));
-      }
+    // Return no index when the namespace has no persistent storage.
+    kj::Maybe<FacetIndex&> tryGetFacetTreeIndex() {
+      if (ns.actorStorage == kj::none) return kj::none;
+      return root.ensureFacetTreeIndex();
     }
 
     // Get the path to the facet's sqlite database, within the actor namespace directory.
@@ -917,13 +917,13 @@ class Server::ActorNamespace final {
       }
     }
 
-    void deleteFacetImpl(ActorStorageNamespace& storage, FacetTreeIndex& index, uint facetId) {
+    void deleteFacetImpl(ActorStorageNamespace& storage, FacetIndex& index, uint facetId) {
       deleteDescendantStorage(storage, index, facetId);
       storage.removeDatabase(getSqlitePathForId(facetId));
     }
 
     void deleteDescendantStorage(ActorStorageNamespace& storage, uint parentId) {
-      KJ_IF_SOME(index, getFacetTreeIndexIfNotEmpty()) {
+      KJ_IF_SOME(index, tryGetFacetTreeIndex()) {
         deleteDescendantStorage(storage, index, parentId);
       } else {
         // There's no index, so there must be no facets (other than the root).
@@ -931,16 +931,14 @@ class Server::ActorNamespace final {
       }
     }
 
-    void deleteDescendantStorage(
-        ActorStorageNamespace& storage, FacetTreeIndex& index, uint parentId) {
+    void deleteDescendantStorage(ActorStorageNamespace& storage, FacetIndex& index, uint parentId) {
       index.forEachChild(parentId,
           [&](uint childId, kj::StringPtr childName) { deleteFacetImpl(storage, index, childId); });
     }
 
     // Recursively copy the subtree rooted at the facet with ID `srcParentId` to a new subtree
     // rooted at the facet with ID `dstParentId`.
-    void cloneFacetImpl(
-        ActorStorageNamespace& storage, FacetTreeIndex& index, uint srcId, uint dstId) {
+    void cloneFacetImpl(ActorStorageNamespace& storage, FacetIndex& index, uint srcId, uint dstId) {
       // Snapshot src's children before recursing, because the recursion mutates the index by
       // allocating new IDs for the destination subtree, which would interfere with a live
       // forEachChild iteration.
