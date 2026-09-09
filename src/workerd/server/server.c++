@@ -407,8 +407,10 @@ class Server::ActorNamespace final {
       KJ_IF_SOME(as, this->actorStorage) {
         auto db = as->openDatabase(kj::Path({"metadata.sqlite"}),
             kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
-        this->ownAlarmScheduler =
-            kj::heap<AlarmScheduler>(clock, timer, kj::mv(db), kj::mv(getActor));
+        this->ownAlarmScheduler = kj::heap<AlarmScheduler>(clock, timer, kj::mv(db),
+            kj::mv(getActor), [&storage = *as, &timer = timer](SqliteDatabase& db) {
+          return storage.confirmDatabaseCommit(db, timer);
+        });
       } else {
         // No on-disk storage -- create an in-memory alarm scheduler.
         auto memDir = kj::newInMemoryDirectory(clock);
@@ -897,8 +899,8 @@ class Server::ActorNamespace final {
         // Facet tree index hasn't been initialized yet. If the file exists, open it. Otherwise,
         // assume empty and return none.
         auto& as = KJ_UNWRAP_OR(ns.actorStorage, return kj::none);
-        auto indexFile = KJ_UNWRAP_OR(as->tryOpenAuxiliaryFile(
-            kj::Path({kj::str(key, ".facets")}), kj::WriteMode::MODIFY),
+        auto indexFile = KJ_UNWRAP_OR(
+            as->tryOpenAuxiliaryFile(kj::Path({kj::str(key, ".facets")}), kj::WriteMode::MODIFY),
             return kj::none);
         return *facetTreeIndex.emplace(kj::heap<FacetTreeIndex>(kj::mv(indexFile)));
       }
@@ -932,9 +934,7 @@ class Server::ActorNamespace final {
     void deleteDescendantStorage(
         ActorStorageNamespace& storage, FacetTreeIndex& index, uint parentId) {
       index.forEachChild(parentId,
-          [&](uint childId, kj::StringPtr childName) {
-        deleteFacetImpl(storage, index, childId);
-      });
+          [&](uint childId, kj::StringPtr childName) { deleteFacetImpl(storage, index, childId); });
     }
 
     // Recursively copy the subtree rooted at the facet with ID `srcParentId` to a new subtree
@@ -1240,8 +1240,7 @@ class Server::ActorNamespace final {
 
             uint selfId = getFacetId();
             auto path = getSqlitePathForId(selfId);
-            auto db = as->openDatabase(
-                kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+            auto db = as->openDatabase(kj::mv(path), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
             auto* database = db.get();
 
             db->afterReset([this, &storage = *as, selfId](SqliteDatabase& db) {
@@ -1692,15 +1691,9 @@ class Server::ActorNamespace final {
         : alarmScheduler(alarmScheduler),
           actor(kj::mv(actor)) {}
 
-    // We ignore the priorTask in workerd because everything should run synchronously.
     kj::Promise<void> scheduleRun(
         kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) override {
-      KJ_IF_SOME(scheduledTime, newAlarmTime) {
-        alarmScheduler.setAlarm(*actor, scheduledTime);
-      } else {
-        alarmScheduler.deleteAlarm(*actor);
-      }
-      return kj::READY_NOW;
+      return alarmScheduler.scheduleRun(*actor, newAlarmTime, kj::mv(priorTask));
     }
 
    private:
@@ -6031,12 +6024,12 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
                   .pageCacheBytes = remote.getPageCacheBytes(),
                 });
           } else {
-            errorReporter.addError(kj::str("remoteLtx cache service \"", diskName,
-                "\" is defined read-only."));
+            errorReporter.addError(
+                kj::str("remoteLtx cache service \"", diskName, "\" is defined read-only."));
           }
         } else {
-          errorReporter.addError(kj::str("remoteLtx cache service \"", diskName,
-              "\" is not a local disk service."));
+          errorReporter.addError(
+              kj::str("remoteLtx cache service \"", diskName, "\" is not a local disk service."));
         }
       } else {
         errorReporter.addError(

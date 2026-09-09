@@ -95,6 +95,52 @@ class AlarmStubWorkerInterface final: public WorkerInterface {
   kj::Function<kj::Promise<kj::Maybe<kj::Date>>()> onAbandon;
 };
 
+KJ_TEST("AlarmScheduler waits for prior scheduling and durable commit") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  auto& clock = kj::nullClock();
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+  auto dir = kj::newInMemoryDirectory(clock);
+  SqliteDatabase::Vfs vfs(*dir);
+  auto db = kj::heap<SqliteDatabase>(
+      vfs, kj::Path({"alarms"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  auto prior = kj::newPromiseAndFulfiller<void>();
+  auto upload = kj::newPromiseAndFulfiller<void>();
+  uint confirmations = 0;
+  AlarmScheduler scheduler(
+      clock, timer, kj::mv(db), failingGetActor(), [&](SqliteDatabase& db) -> kj::Promise<void> {
+    ++confirmations;
+    auto query = db.run("SELECT COUNT(*) FROM _cf_ALARM;");
+    KJ_EXPECT(query.getInt64(0) == (confirmations == 1 ? 1 : 0));
+    return kj::mv(upload.promise);
+  });
+  ActorKey actor{.actorId = "test", .name = kj::none};
+  auto time = kj::UNIX_EPOCH + 24 * kj::HOURS;
+  auto scheduled = scheduler.scheduleRun(actor, time, kj::mv(prior.promise));
+  KJ_EXPECT(!scheduled.poll(waitScope));
+  KJ_EXPECT(scheduler.getAlarm(actor) == kj::none);
+  KJ_EXPECT(confirmations == 0);
+  prior.fulfiller->fulfill();
+  KJ_EXPECT(!scheduled.poll(waitScope));
+  KJ_EXPECT(scheduler.getAlarm(actor) == time);
+  KJ_EXPECT(confirmations == 1);
+  upload.fulfiller->fulfill();
+  scheduled.wait(waitScope);
+
+  upload = kj::newPromiseAndFulfiller<void>();
+  auto deleted = scheduler.scheduleRun(actor, kj::none, kj::READY_NOW);
+  KJ_EXPECT(!deleted.poll(waitScope));
+  KJ_EXPECT(confirmations == 2);
+  upload.fulfiller->reject(KJ_EXCEPTION(FAILED, "Bucket upload failed"));
+  KJ_EXPECT_THROW_MESSAGE("Bucket upload failed", deleted.wait(waitScope));
+
+  auto failed = scheduler.scheduleRun(
+      actor, time, kj::Promise<void>(KJ_EXCEPTION(FAILED, "Prior scheduling failed")));
+  KJ_EXPECT_THROW_MESSAGE("Prior scheduling failed", failed.wait(waitScope));
+  KJ_EXPECT(confirmations == 2);
+  KJ_EXPECT(scheduler.getAlarm(actor) == kj::none);
+}
+
 KJ_TEST("AlarmScheduler migrates a database created before the actor_name column existed") {
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);

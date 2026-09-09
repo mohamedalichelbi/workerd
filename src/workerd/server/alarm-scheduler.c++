@@ -33,29 +33,41 @@ AlarmScheduler::AlarmScheduler(const kj::Clock& clock,
     const SqliteDatabase::Vfs& vfs,
     kj::Path path,
     GetActorFn getActor)
-    : AlarmScheduler(clock, timer,
-          [&] {
-    auto db = kj::heap<SqliteDatabase>(vfs, kj::mv(path),
-        kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
-    db->run("PRAGMA journal_mode=WAL;");
-    return db;
-  }(),
-          kj::mv(getActor)) {}
+    : AlarmScheduler(clock, timer, [&] {
+        auto db = kj::heap<SqliteDatabase>(vfs, kj::mv(path),
+            kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT);
+        db->run("PRAGMA journal_mode=WAL;");
+        return db;
+      }(), kj::mv(getActor), [](SqliteDatabase&) -> kj::Promise<void> { return kj::READY_NOW; }) {}
 
 AlarmScheduler::AlarmScheduler(const kj::Clock& clock,
     kj::Timer& timer,
     kj::Own<SqliteDatabase> db,
-    GetActorFn getActor)
+    GetActorFn getActor,
+    ConfirmCommitFn confirmCommit)
     : clock(clock),
       timer(timer),
       random(makeSeededRandomEngine()),
       getActor(kj::mv(getActor)),
       db([&] {
-    ensureInitialized(*db);
-    return kj::mv(db);
-  }()),
+        ensureInitialized(*db);
+        return kj::mv(db);
+      }()),
+      confirmCommit(kj::mv(confirmCommit)),
       tasks(*this) {
   loadAlarmsFromDb();
+}
+
+kj::Promise<void> AlarmScheduler::scheduleRun(
+    ActorKey actor, kj::Maybe<kj::Date> scheduledTime, kj::Promise<void> priorTask) {
+  return priorTask.then([this, actor = actor.clone(), scheduledTime]() {
+    KJ_IF_SOME(time, scheduledTime) {
+      setAlarm(*actor, time);
+    } else {
+      deleteAlarm(*actor);
+    }
+    return confirmCommit(*db);
+  });
 }
 
 void AlarmScheduler::ensureInitialized(SqliteDatabase& db) {

@@ -69,6 +69,7 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   // Obtains a WorkerInterface for the given actor. `actor.name` carries the actor's original name
   // (from `idFromName()`) if it was persisted, so that the reconstructed ID exposes `ctx.id.name`.
   using GetActorFn = kj::Function<kj::Own<WorkerInterface>(const ActorKey& actor)>;
+  using ConfirmCommitFn = kj::Function<kj::Promise<void>(SqliteDatabase&)>;
 
   AlarmScheduler(const kj::Clock& clock,
       kj::Timer& timer,
@@ -79,7 +80,12 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   AlarmScheduler(const kj::Clock& clock,
       kj::Timer& timer,
       kj::Own<SqliteDatabase> db,
-      GetActorFn getActor);
+      GetActorFn getActor,
+      ConfirmCommitFn confirmCommit);
+
+  // The result confirms durable scheduling, not only the local SQLite write.
+  kj::Promise<void> scheduleRun(
+      ActorKey actor, kj::Maybe<kj::Date> scheduledTime, kj::Promise<void> priorTask);
 
   kj::Maybe<kj::Date> getAlarm(ActorKey actor);
   bool setAlarm(ActorKey actor, kj::Date scheduledTime);
@@ -95,6 +101,7 @@ class AlarmScheduler final: kj::TaskSet::ErrorHandler {
   std::default_random_engine random;
   GetActorFn getActor;
   kj::Own<SqliteDatabase> db;
+  ConfirmCommitFn confirmCommit;
   kj::TaskSet tasks;
 
   struct ScheduledAlarm {
