@@ -4,6 +4,8 @@
 
 #include "actor-storage.h"
 
+#include "facet-tree-index.h"
+
 #include <kj/debug.h>
 
 #include <cctype>
@@ -179,6 +181,10 @@ class RemoteLtxActorStorageNamespace final: public ActorStorageNamespace {
   bool cloneDatabase(kj::PathPtr source, kj::PathPtr destination) override {
     KJ_FAIL_REQUIRE(
         "remote LTX VFS does not support Durable Object facet cloning", source, destination);
+  }
+
+  bool supportsCloning() override {
+    return false;
   }
 
  private:

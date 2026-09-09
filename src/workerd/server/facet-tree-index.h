@@ -18,6 +18,14 @@ class FacetIndex {
   virtual kj::Promise<void> confirm() {
     return kj::READY_NOW;
   }
+  // Return false when the backend must delete database files instead.
+  // Confirm a successful mapping change before releasing its response.
+  virtual bool eraseFacet(uint, kj::StringPtr) {
+    return false;
+  }
+  virtual bool eraseDescendants(uint) {
+    return false;
+  }
   virtual ~FacetIndex() noexcept(false) = default;
 };
 

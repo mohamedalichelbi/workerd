@@ -10,6 +10,14 @@ using kj::uint;
 
 namespace {
 
+class EraseRegulator final: public SqliteDatabase::Regulator {
+ public:
+  bool isAllowedTrigger(kj::StringPtr name) const override {
+    return name == "removed";
+  }
+};
+constexpr EraseRegulator ERASE_REGULATOR;
+
 class SqliteFacetIndex final: public FacetIndex {
  public:
   SqliteFacetIndex(
@@ -23,6 +31,11 @@ class SqliteFacetIndex final: public FacetIndex {
         name TEXT NOT NULL CHECK(length(CAST(name AS BLOB)) BETWEEN 1 AND 65535),
         UNIQUE(parent, name)
       );
+      CREATE TABLE IF NOT EXISTS facet_sequence (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        last_id INTEGER NOT NULL
+      );
+      INSERT OR IGNORE INTO facet_sequence SELECT 1, COALESCE(MAX(id), 0) FROM facets;
     )");
   }
 
@@ -34,11 +47,17 @@ class SqliteFacetIndex final: public FacetIndex {
     }
     uint nextId;
     {
-      auto query = db->run("SELECT COALESCE(MAX(id), 0) + 1 FROM facets");
+      auto query = db->run("SELECT last_id + 1 FROM facet_sequence WHERE singleton = 1");
       nextId = query.getInt64(0);
     }
     KJ_REQUIRE(nextId <= MAX_ID, "Maximum number of facets exceeded");
     KJ_REQUIRE(parent < nextId, "Invalid parent ID");
+    if (parent != 0) {
+      auto query = db->run("SELECT id FROM facets WHERE id = ?", parent);
+      KJ_REQUIRE(!query.isDone(), "Invalid parent ID");
+    }
+    // Persist the allocation before inserting the name. A failed insert can skip an ID.
+    db->run("UPDATE facet_sequence SET last_id = ? WHERE singleton = 1", nextId);
     db->run("INSERT INTO facets VALUES (?, ?, ?)", nextId, parent, name);
     return nextId;
   }
@@ -53,6 +72,28 @@ class SqliteFacetIndex final: public FacetIndex {
 
   kj::Promise<void> confirm() override {
     return confirmCommit(*db);
+  }
+
+  bool eraseFacet(uint parent, kj::StringPtr name) override {
+    db->run({.regulator = ERASE_REGULATOR}, R"(
+      WITH RECURSIVE removed(id) AS (
+        SELECT id FROM facets WHERE parent = ? AND name = ?
+        UNION ALL SELECT facets.id FROM facets JOIN removed ON facets.parent = removed.id
+      ) DELETE FROM facets WHERE id IN (SELECT id FROM removed)
+    )",
+        parent, name);
+    return true;
+  }
+
+  bool eraseDescendants(uint parent) override {
+    db->run({.regulator = ERASE_REGULATOR}, R"(
+      WITH RECURSIVE removed(id) AS (
+        SELECT id FROM facets WHERE parent = ?
+        UNION ALL SELECT facets.id FROM facets JOIN removed ON facets.parent = removed.id
+      ) DELETE FROM facets WHERE id IN (SELECT id FROM removed)
+    )",
+        parent);
+    return true;
   }
 
  private:

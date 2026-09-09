@@ -772,6 +772,10 @@ class Server::ActorNamespace final {
       KJ_IF_SOME(as, ns.actorStorage) {
         // Note that if there's no facet index then there couldn't possibly be any child storage.
         KJ_IF_SOME(index, tryGetFacetTreeIndex()) {
+          if (index.eraseFacet(getFacetId(), name)) {
+            confirmFacetIndex(index);
+            return;
+          }
           uint childId = index.getId(getFacetId(), name);
           deleteFacetImpl(*as, index, childId);
         }
@@ -779,6 +783,12 @@ class Server::ActorNamespace final {
     }
 
     void cloneFacet(kj::StringPtr src, kj::StringPtr dst) override {
+      if (src != dst) {
+        KJ_IF_SOME(storage, ns.actorStorage) {
+          KJ_REQUIRE(storage->supportsCloning(),
+              "remote LTX VFS does not support Durable Object facet cloning");
+        }
+      }
       // Replacing a facet implies aborting it.
       abortFacet(dst, JSG_KJ_EXCEPTION(FAILED, Error, "Facet was cloned-over."));
 
@@ -924,11 +934,26 @@ class Server::ActorNamespace final {
 
     void deleteDescendantStorage(ActorStorageNamespace& storage, uint parentId) {
       KJ_IF_SOME(index, tryGetFacetTreeIndex()) {
+        if (index.eraseDescendants(parentId)) {
+          for (auto& facet: facets) {
+            facet.value->abort(JSG_KJ_EXCEPTION(FAILED, Error, "Parent storage was reset."));
+          }
+          facets.clear();
+          confirmFacetIndex(index);
+          return;
+        }
         deleteDescendantStorage(storage, index, parentId);
       } else {
         // There's no index, so there must be no facets (other than the root).
         KJ_ASSERT(parentId == 0);
       }
+    }
+
+    void confirmFacetIndex(FacetIndex& index) {
+      auto& activeActor = KJ_ASSERT_NONNULL(actor);
+      ns.waitUntilTasks.add(activeActor->getOutputGate()
+                                .lockWhile(index.confirm(), nullptr)
+                                .attach(root.addRef(), activeActor->addRef()));
     }
 
     void deleteDescendantStorage(ActorStorageNamespace& storage, FacetIndex& index, uint parentId) {

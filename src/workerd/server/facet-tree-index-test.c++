@@ -68,6 +68,51 @@ KJ_TEST("SQLite facet index preserves names and confirms storage") {
   KJ_EXPECT_THROW_MESSAGE("Index upload failed", index->confirm().wait(waitScope));
 }
 
+KJ_TEST("SQLite facet deletion preserves other branches and never reuses IDs") {
+  auto directory = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*directory);
+  auto open = [&]() {
+    return newSqliteFacetIndex(kj::heap<SqliteDatabase>(vfs, kj::Path({"facets"}),
+                                   kj::WriteMode::CREATE | kj::WriteMode::MODIFY),
+        [](SqliteDatabase&) -> kj::Promise<void> { return kj::READY_NOW; });
+  };
+  {
+    auto index = open();
+    KJ_EXPECT(index->getId(0, "alpha") == 1);
+    KJ_EXPECT(index->getId(0, "beta") == 2);
+    KJ_EXPECT(index->getId(1, "child") == 3);
+    KJ_EXPECT(index->getId(3, "nested") == 4);
+    KJ_EXPECT(index->eraseFacet(0, "alpha"));
+    expectChildren(*index, 0, {{2, "beta"}});
+    expectChildren(*index, 1, {});
+    expectChildren(*index, 3, {});
+    KJ_EXPECT_THROW_MESSAGE("Invalid parent ID", index->getId(1, "orphan"));
+    KJ_EXPECT(index->eraseFacet(0, "missing"));
+    KJ_EXPECT(index->getId(0, "alpha") == 5);
+    KJ_EXPECT(index->getId(5, "child") == 6);
+    KJ_EXPECT(index->eraseDescendants(5));
+    KJ_EXPECT(index->getId(0, "alpha") == 5);
+    expectChildren(*index, 5, {});
+    KJ_EXPECT(index->eraseDescendants(0));
+    expectChildren(*index, 0, {});
+  }
+  auto index = open();
+  KJ_EXPECT(index->getId(0, "beta") == 7);
+}
+
+KJ_TEST("SQLite facet sequence starts above existing imported IDs") {
+  auto directory = kj::newInMemoryDirectory(kj::nullClock());
+  SqliteDatabase::Vfs vfs(*directory);
+  auto db = kj::heap<SqliteDatabase>(
+      vfs, kj::Path({"facets"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+  db->run("CREATE TABLE facets(id INTEGER PRIMARY KEY, parent INTEGER, name TEXT)");
+  db->run("INSERT INTO facets VALUES (12, 0, 'existing')");
+  auto index = newSqliteFacetIndex(
+      kj::mv(db), [](SqliteDatabase&) -> kj::Promise<void> { return kj::READY_NOW; });
+  KJ_EXPECT(index->eraseDescendants(0));
+  KJ_EXPECT(index->getId(0, "new") == 13);
+}
+
 KJ_TEST("FacetTreeIndex basic functionality") {
   auto file = kj::newInMemoryFile(kj::nullClock());
 

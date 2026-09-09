@@ -4,14 +4,14 @@
 
 #pragma once
 
-#include "facet-tree-index.h"
-
 #include <workerd/util/sqlite.h>
 
 #include <kj/async-io.h>
 #include <kj/filesystem.h>
 
 namespace workerd::server {
+
+class FacetIndex;
 
 // Owns the storage resources for one Durable Object namespace. Implementations
 // can store SQLite databases and the small facet index in different systems.
@@ -28,6 +28,9 @@ class ActorStorageNamespace {
 
   // A database can include journal files that are private to the backend.
   virtual void removeDatabase(kj::PathPtr path) = 0;
+  virtual bool supportsCloning() {
+    return true;
+  }
   virtual bool cloneDatabase(kj::PathPtr source, kj::PathPtr destination) = 0;
 
   virtual ~ActorStorageNamespace() noexcept(false) = default;
